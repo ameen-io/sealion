@@ -1,0 +1,113 @@
+name: Coznt PR Review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  packages: read
+
+concurrency:
+  group: coznt-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Coznt PR review
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Check out trusted base branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch PR head and resolve review range
+        id: range
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          github_auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $github_auth" fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/coznt-pr-${PR_NUMBER}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          git -c core.quotePath=false diff --name-only "$merge_base" "$HEAD_SHA" > "$RUNNER_TEMP/coznt-reviewed-files.txt"
+
+      - name: Fetch Coznt governed review context
+        id: context
+        uses: ameen-io/open-code-review/actions/coznt-review-context@500d0b5410be8e32596989ae205abac064c8f1f4
+        with:
+          coznt_url: ${{ secrets.COZNT_URL }}
+          coznt_api_key: ${{ secrets.COZNT_API_KEY }}
+          repository: ${{ github.repository }}
+          pull_number: ${{ github.event.pull_request.number }}
+          head_sha: ${{ github.event.pull_request.head.sha }}
+
+      - name: Run Coznt PR reviewer
+        id: reviewer
+        if: ${{ steps.context.outputs.background_path != '' }}
+        shell: bash
+        env:
+          MERGE_BASE: ${{ steps.range.outputs.merge_base }}
+          HEAD_SHA: ${{ steps.range.outputs.head_sha }}
+          OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
+          OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
+          OCR_USE_ANTHROPIC: ${{ secrets.OCR_LLM_USE_ANTHROPIC }}
+          COZNT_BACKGROUND_PATH: ${{ steps.context.outputs.background_path }}
+        run: |
+          set +e
+          mkdir -p "$GITHUB_WORKSPACE/.ocr-results"
+          context_mount=()
+          background_arg=""
+          if [ -n "$COZNT_BACKGROUND_PATH" ] && [ -f "$COZNT_BACKGROUND_PATH" ]; then
+            context_mount=(--volume "$COZNT_BACKGROUND_PATH:/run/coznt/background.md:ro")
+            background_arg=" --background-file /run/coznt/background.md"
+          fi
+          docker run --rm             --volume "$GITHUB_WORKSPACE:/repo:ro"             "${context_mount[@]}"             --workdir /repo             --env OCR_LLM_URL             --env OCR_LLM_TOKEN             --env OCR_LLM_MODEL             --env OCR_USE_ANTHROPIC             --env MERGE_BASE             --env HEAD_SHA             --entrypoint /bin/sh             ghcr.io/ameen-io/ocr-reviewer:v1.10.0             -c 'export HOME=/tmp/ocr-home; mkdir -p "$HOME"; git config --global --add safe.directory /repo && exec ocr review --from "$MERGE_BASE" --to "$HEAD_SHA" --audience agent --format json'"$background_arg"             > "$GITHUB_WORKSPACE/.ocr-results/coznt-pr-review.json"             2> "$RUNNER_TEMP/coznt-pr-review.stderr"
+          review_code=$?
+          if [ "$review_code" -ne 0 ]; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "error=Coznt PR reviewer failed with exit code $review_code." >> "$GITHUB_OUTPUT"
+          elif ! jq -e . "$GITHUB_WORKSPACE/.ocr-results/coznt-pr-review.json" > /dev/null 2>&1; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "error=Coznt PR reviewer returned invalid JSON." >> "$GITHUB_OUTPUT"
+          else
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "error=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish Coznt PR review
+        if: ${{ always() && steps.context.outputs.background_path != '' }}
+        uses: ameen-io/open-code-review/actions/coznt-pr-review@500d0b5410be8e32596989ae205abac064c8f1f4
+        with:
+          title: Coznt PR Review (Repository Agent)
+          marker: '<!-- coznt-repository-pr-review -->'
+          result_path: ${{ github.workspace }}/.ocr-results/coznt-pr-review.json
+          reviewed_files_path: ${{ runner.temp }}/coznt-reviewed-files.txt
+          context_manifest_path: ${{ steps.context.outputs.manifest_path }}
+          review_status: ${{ steps.reviewer.outputs.status }}
+          review_error: ${{ steps.reviewer.outputs.error }}
+          model: ${{ secrets.OCR_LLM_MODEL }}
+          github_token: ${{ github.token }}
+
+      - name: Remove governed review context
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/coznt-ocr-background.md" "$RUNNER_TEMP/coznt-ocr-context-manifest.json"
