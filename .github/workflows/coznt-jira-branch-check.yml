@@ -1,0 +1,109 @@
+name: Coznt Jira Branch Guard
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: coznt-jira-branch-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate Jira branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate Jira issue branch
+        shell: bash
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+          JIRA_BASE_URL: ${{ secrets.COZNT_JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.COZNT_JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.COZNT_JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEYS: ${{ secrets.COZNT_JIRA_PROJECT_KEYS }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$HEAD_REPOSITORY" == "$TARGET_REPOSITORY" && \
+            ( "$HEAD_BRANCH" == "dev" || "$HEAD_BRANCH" == "develop" ) && \
+            "$BASE_BRANCH" == "$DEFAULT_BRANCH" ]]; then
+            echo "Same-repository $HEAD_BRANCH → $DEFAULT_BRANCH promotion; Jira branch validation is not applicable."
+            exit 0
+          fi
+
+          if [[ -z "${JIRA_BASE_URL:-}" || -z "${JIRA_EMAIL:-}" || -z "${JIRA_API_TOKEN:-}" || -z "${JIRA_PROJECT_KEYS:-}" ]]; then
+            echo "::error::Coznt Jira branch guard is not configured with all required repository secrets. Reapply it from Coznt."
+            exit 1
+          fi
+
+          mapfile -t issue_keys < <(printf '%s' "$HEAD_BRANCH" | grep -oE '[A-Z][A-Z0-9]*-[0-9]+' | sort -u || true)
+          if [[ "${#issue_keys[@]}" -ne 1 ]]; then
+            echo "::error::Branch '$HEAD_BRANCH' must contain exactly one Jira issue key such as ABC-123."
+            exit 1
+          fi
+          issue_key="${issue_keys[0]}"
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          jira_url="${JIRA_BASE_URL%/}/rest/api/3/issue/${issue_key}?fields=project"
+          if ! http_code="$(curl \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --output "$response_file" \
+            --write-out "%{http_code}" \
+            --user "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            --header "Accept: application/json" \
+            "$jira_url")"; then
+            echo "::error::Jira issue validation request failed after retries."
+            exit 1
+          fi
+
+          case "$http_code" in
+            200)
+              issue_project_key="$(jq -r '.fields.project.key // empty' "$response_file")"
+              if [[ -z "$issue_project_key" ]]; then
+                echo "::error::Jira returned an invalid issue response for '$issue_key'."
+                exit 1
+              fi
+              allowed=false
+              IFS=',' read -r -a allowed_project_keys <<< "$JIRA_PROJECT_KEYS"
+              for allowed_project_key in "${allowed_project_keys[@]}"; do
+                if [[ "$issue_project_key" == "$allowed_project_key" ]]; then
+                  allowed=true
+                  break
+                fi
+              done
+              if [[ "$allowed" != "true" ]]; then
+                echo "::error::Jira issue '$issue_key' belongs to '$issue_project_key', which is not bound to this Coznt project."
+                exit 1
+              fi
+              echo "Validated Jira issue: $issue_key"
+              ;;
+            401|403)
+              echo "::error::Coznt's Jira credentials were rejected (HTTP $http_code). Reapply after updating the Atlassian connection."
+              exit 1
+              ;;
+            404)
+              echo "::error::Jira issue '$issue_key' was not found."
+              exit 1
+              ;;
+            429)
+              echo "::error::Jira rate-limited branch validation. Retry this check shortly."
+              exit 1
+              ;;
+            *)
+              echo "::error::Jira issue validation failed with HTTP $http_code."
+              exit 1
+              ;;
+          esac
